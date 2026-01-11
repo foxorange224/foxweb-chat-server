@@ -1,42 +1,137 @@
+// server.js - FoxWeb Chat Server v4.0
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
-const fetch = require('node-fetch');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const { body, validationResult } = require('express-validator');
 
 const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
 
-const server = http.createServer(app);
-const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-    credentials: true
-  },
-  transports: ['websocket', 'polling'],
-  pingTimeout: 60000,
-  pingInterval: 25000
+// ===== CONFIGURACIÓN DE SEGURIDAD =====
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      connectSrc: ["'self'", "wss:", "ws:"]
+    }
+  }
+}));
+
+app.use(cors({
+  origin: process.env.NODE_ENV === 'production' 
+    ? ['https://foxweb.vercel.app', 'https://foxweb-chat.vercel.app']
+    : '*',
+  credentials: true
+}));
+
+app.use(express.json({ limit: '10kb' }));
+
+// Rate limiting por IP
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 100,
+  message: { error: 'Demasiadas solicitudes desde esta IP' }
 });
 
-// ===== ALMACENAMIENTO OPTIMIZADO =====
-class ChatStorage {
+const authLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutos
+  max: 10,
+  message: { error: 'Demasiados intentos de autenticación' }
+});
+
+app.use('/api/', apiLimiter);
+app.use('/auth/', authLimiter);
+
+// ===== ALMACENAMIENTO OPTIMIZADO Y SEGURO =====
+class SecureChatStorage {
   constructor() {
     this.users = new Map(); // socket.id -> userData
-    this.userIds = new Map(); // userId -> socket.id (para búsqueda rápida)
-    this.messages = []; // Mensajes del chat
-    this.typingUsers = new Map(); // username -> timestamp
+    this.userIds = new Map(); // userId -> socket.id
+    this.messages = [];
+    this.typingUsers = new Map();
+    this.userMessageCounts = new Map(); // userId -> {count, windowStart}
+    this.bannedIPs = new Map(); // IP -> {bannedUntil, reason}
   }
 
-  // Agregar usuario
-  addUser(socketId, userData) {
+  // Sanitización de entrada
+  sanitizeInput(input, type = 'string') {
+    if (!input) return '';
+    
+    if (type === 'string') {
+      // Eliminar etiquetas HTML/script peligrosas
+      return String(input)
+        .replace(/[<>]/g, c => ({ '<': '&lt;', '>': '&gt;' }[c]))
+        .substring(0, 500)
+        .trim();
+    }
+    
+    if (type === 'username') {
+      return String(input)
+        .replace(/[^a-zA-Z0-9-_ ]/g, '')
+        .substring(0, 20)
+        .trim();
+    }
+    
+    return String(input).substring(0, 1000).trim();
+  }
+
+  // Validación de rate limiting por usuario
+  checkRateLimit(userId, maxMessages = 3, timeWindow = 5000) {
+    const now = Date.now();
+    const userData = this.userMessageCounts.get(userId) || { count: 0, windowStart: now };
+    
+    if (now - userData.windowStart > timeWindow) {
+      userData.count = 1;
+      userData.windowStart = now;
+    } else {
+      userData.count++;
+    }
+    
+    this.userMessageCounts.set(userId, userData);
+    return userData.count <= maxMessages;
+  }
+
+  // Validación de mensaje
+  validateMessage(message) {
+    if (!message || typeof message !== 'object') return false;
+    
+    const required = ['text', 'username', 'userId'];
+    if (!required.every(field => field in message)) return false;
+    
+    if (typeof message.text !== 'string' || message.text.length > 500) return false;
+    if (typeof message.username !== 'string' || message.username.length > 20) return false;
+    
+    // Validar que el texto no sea solo espacios
+    if (!message.text.trim()) return false;
+    
+    return true;
+  }
+
+  addUser(socketId, userData, ip) {
+    // Verificar si IP está baneada
+    const banInfo = this.bannedIPs.get(ip);
+    if (banInfo && banInfo.bannedUntil > Date.now()) {
+      throw new Error(`IP baneada hasta ${new Date(banInfo.bannedUntil).toLocaleString()}: ${banInfo.reason}`);
+    }
+    
+    const sanitizedUsername = this.sanitizeInput(userData.username, 'username');
+    if (!sanitizedUsername || sanitizedUsername.length < 2) {
+      throw new Error('Nombre de usuario inválido');
+    }
+    
     const user = {
       socketId,
-      userId: userData.userId || socketId,
-      username: userData.username || `Usuario${socketId.substring(0, 5)}`,
+      userId: userData.userId || `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      username: sanitizedUsername,
+      ip: ip,
       joined: Date.now(),
-      lastActive: Date.now()
+      lastActive: Date.now(),
+      messageCount: 0,
+      warnings: 0
     };
     
     this.users.set(socketId, user);
@@ -44,332 +139,362 @@ class ChatStorage {
     return user;
   }
 
-  // Eliminar usuario
   removeUser(socketId) {
     const user = this.users.get(socketId);
     if (user) {
       this.users.delete(socketId);
       this.userIds.delete(user.userId);
       this.typingUsers.delete(user.username);
+      this.userMessageCounts.delete(user.userId);
     }
     return user;
   }
 
-  // Obtener usuario por socketId
-  getUser(socketId) {
-    return this.users.get(socketId);
-  }
-
-  // Obtener usuario por userId
-  getUserByUserId(userId) {
-    const socketId = this.userIds.get(userId);
-    return socketId ? this.users.get(socketId) : null;
-  }
-
-  // Agregar mensaje
   addMessage(message) {
-    this.messages.push(message);
+    // Validación adicional del mensaje
+    if (!this.validateMessage(message)) {
+      throw new Error('Mensaje inválido');
+    }
     
-    // Limitar tamaño manteniendo eficiencia
+    // Aplicar rate limiting
+    if (!this.checkRateLimit(message.userId)) {
+      throw new Error('Demasiados mensajes en poco tiempo. Espera unos segundos.');
+    }
+    
+    const sanitizedMessage = {
+      ...message,
+      text: this.sanitizeInput(message.text, 'string'),
+      timestamp: new Date().toISOString(),
+      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    };
+    
+    this.messages.push(sanitizedMessage);
+    
+    // Limitar tamaño manteniendo los más recientes
+    const MAX_MESSAGES = 2000;
     if (this.messages.length > MAX_MESSAGES) {
-      // Mantener solo los últimos mensajes
       this.messages = this.messages.slice(-MAX_MESSAGES);
     }
-    return message;
-  }
-
-  // Obtener historial
-  getHistory(limit = 50) {
-    return this.messages.slice(-limit);
-  }
-
-  // Agregar usuario escribiendo
-  addTypingUser(username) {
-    this.typingUsers.set(username, Date.now());
-  }
-
-  // Eliminar usuario escribiendo
-  removeTypingUser(username) {
-    this.typingUsers.delete(username);
-  }
-
-  // Obtener usuarios escribiendo
-  getTypingUsers() {
-    const now = Date.now();
-    const expired = [];
     
-    // Limpiar usuarios expirados (más de 10 segundos)
-    for (const [username, timestamp] of this.typingUsers) {
-      if (now - timestamp > 10000) { // 10 segundos
-        expired.push(username);
+    return sanitizedMessage;
+  }
+
+  banIP(ip, durationMinutes = 60, reason = 'Violación de términos') {
+    const bannedUntil = Date.now() + (durationMinutes * 60 * 1000);
+    this.bannedIPs.set(ip, { bannedUntil, reason });
+    
+    // Limpiar baneos expirados periódicamente
+    setTimeout(() => {
+      const banInfo = this.bannedIPs.get(ip);
+      if (banInfo && banInfo.bannedUntil < Date.now()) {
+        this.bannedIPs.delete(ip);
       }
-    }
-    
-    expired.forEach(username => this.typingUsers.delete(username));
-    
-    return Array.from(this.typingUsers.keys());
+    }, durationMinutes * 60 * 1000);
   }
 
-  // Limpiar mensajes antiguos
-  cleanOldMessages(retentionHours = 24) {
-    const retentionTime = retentionHours * 60 * 60 * 1000;
-    const cutoffTime = Date.now() - retentionTime;
-    
-    this.messages = this.messages.filter(msg => {
-      const messageTime = new Date(msg.timestamp).getTime();
-      return messageTime >= cutoffTime;
-    });
-    
-    return this.messages.length;
-  }
-
-  // Estadísticas
   getStats() {
     return {
       users: this.users.size,
       messages: this.messages.length,
-      typingUsers: this.typingUsers.size
+      typingUsers: this.typingUsers.size,
+      bannedIPs: this.bannedIPs.size
     };
   }
 }
 
-// ===== CONFIGURACIÓN =====
+// ===== CONFIGURACIÓN DEL SERVIDOR =====
 const MESSAGE_RETENTION_HOURS = 24;
-const MAX_MESSAGES = 1000;
-const CLEANUP_INTERVAL = 30 * 60 * 1000; // Cada 30 minutos
-const PING_INTERVAL = 5 * 60 * 1000; // Cada 5 minutos
-const TYPING_TIMEOUT = 5000; // 5 segundos para typing
+const CLEANUP_INTERVAL = 30 * 60 * 1000; // 30 minutos
+const MAX_MESSAGES_PER_USER = 3;
+const TIME_WINDOW_MS = 5000; // 5 segundos
 
-// Inicializar almacenamiento
-const storage = new ChatStorage();
+const storage = new SecureChatStorage();
 
-// ===== FUNCIONES AUXILIARES =====
-function isValidUsername(username) {
-  return username && 
-         typeof username === 'string' && 
-         username.trim().length >= 2 && 
-         username.trim().length <= 20;
-}
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: process.env.NODE_ENV === 'production'
+      ? ['https://foxweb.vercel.app', 'https://foxweb-chat.vercel.app']
+      : '*',
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e6 // 1MB máximo para transferencias
+});
 
-function sanitizeMessage(text) {
-  if (typeof text !== 'string') return '';
-  return text.trim().substring(0, 500); // Limitar a 500 caracteres
-}
-
-function generateMessageId() {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-}
-
-// ===== LIMPIEZA PERIÓDICA =====
-setInterval(() => {
-  try {
-    const count = storage.cleanOldMessages(MESSAGE_RETENTION_HOURS);
-    console.log(`🧹 Mensajes limpiados. Total: ${count}`);
-  } catch (error) {
-    console.error('Error en limpieza periódica:', error);
-  }
-}, CLEANUP_INTERVAL);
-
-// ===== PING AUTOMÁTICO MEJORADO =====
-let pingServiceInterval;
-
-function startPingService() {
-  const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://foxweb-chat-server.onrender.com';
+// ===== MIDDLEWARE DE SOCKET.IO PARA SEGURIDAD =====
+io.use((socket, next) => {
+  const clientIP = socket.handshake.address;
+  console.log(`🔍 Conexión desde IP: ${clientIP}`);
   
-  if (!serverUrl) {
-    console.warn('⚠️ No se configuró URL externa para ping automático');
-    return;
-  }
+  // Aquí podrías agregar validaciones adicionales de IP
+  // Por ejemplo, verificar listas negras
   
-  pingServiceInterval = setInterval(async () => {
-    try {
-      const response = await fetch(serverUrl, {
-        timeout: 10000,
-        headers: { 'User-Agent': 'FoxWeb-Chat-Ping/1.0' }
-      });
-      
-      console.log(`✅ Ping automático: ${response.status} - ${new Date().toLocaleTimeString()}`);
-    } catch (error) {
-      console.log('⚠️ Error en ping automático:', error.message);
-    }
-  }, PING_INTERVAL);
-  
-  console.log('🔄 Servicio de ping iniciado');
-}
+  next();
+});
 
-// ===== SOCKET.IO EVENTOS OPTIMIZADOS =====
+// ===== EVENTOS DE SOCKET.IO MEJORADOS =====
 io.on('connection', (socket) => {
-  console.log('🔗 Nuevo usuario conectado:', socket.id);
+  const clientIP = socket.handshake.address;
+  console.log(`🔗 Nuevo usuario conectado: ${socket.id} desde ${clientIP}`);
   
   // Enviar estadísticas iniciales
   socket.emit('userCount', storage.users.size);
-  
-  // Enviar historial de mensajes
   socket.emit('history', {
-    messages: storage.getHistory(50),
+    messages: storage.messages.slice(-50),
     total: storage.messages.length
   });
 
   // Unirse al chat
   socket.on('join', (userData) => {
     try {
-      // Validar datos del usuario
-      if (!userData || !isValidUsername(userData.username)) {
-        socket.emit('error', { message: 'Nombre de usuario inválido' });
+      // Validación del esquema
+      if (!userData || !userData.username || typeof userData.username !== 'string') {
+        socket.emit('error', { 
+          code: 'INVALID_DATA',
+          message: 'Datos de usuario inválidos' 
+        });
         return;
       }
+
+      const user = storage.addUser(socket.id, userData, clientIP);
       
-      // Registrar usuario
-      const user = storage.addUser(socket.id, {
-        username: userData.username.trim(),
-        userId: userData.userId || `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-      });
-      
-      // Actualizar última actividad
-      user.lastActive = Date.now();
+      // Asociar IP con socket
+      socket.data.ip = clientIP;
+      socket.data.userId = user.userId;
       
       // Notificar a todos
       socket.broadcast.emit('userJoined', {
         username: user.username,
         userId: user.userId,
-        onlineCount: storage.users.size
+        onlineCount: storage.users.size,
+        timestamp: new Date().toISOString()
       });
       
-      // Enviar usuarios en línea
+      // Actualizar todos los clientes
       updateOnlineUsers();
       
       console.log(`👋 ${user.username} se unió al chat. Total: ${storage.users.size}`);
       
     } catch (error) {
-      console.error('Error en evento join:', error);
-      socket.emit('error', { message: 'Error al unirse al chat' });
+      console.error('Error en join:', error.message);
+      socket.emit('error', { 
+        code: 'JOIN_ERROR', 
+        message: error.message 
+      });
+      
+      // Si es error de IP baneada, desconectar
+      if (error.message.includes('baneada')) {
+        setTimeout(() => socket.disconnect(true), 2000);
+      }
     }
   });
-  
-  // Recibir mensaje
+
+  // Recibir mensaje con validación
   socket.on('message', (messageData) => {
     try {
       const user = storage.getUser(socket.id);
       if (!user) {
-        socket.emit('error', { message: 'Usuario no autenticado' });
+        socket.emit('error', { 
+          code: 'UNAUTHENTICATED',
+          message: 'Usuario no autenticado' 
+        });
         return;
       }
-      
-      const text = sanitizeMessage(messageData.text);
-      if (!text) {
-        socket.emit('error', { message: 'Mensaje vacío' });
+
+      // Validar esquema del mensaje
+      if (!messageData || typeof messageData.text !== 'string') {
+        socket.emit('error', { 
+          code: 'INVALID_MESSAGE',
+          message: 'Mensaje inválido' 
+        });
         return;
       }
-      
-      // Crear mensaje
+
+      // Verificar rate limiting (a nivel servidor también)
+      if (!storage.checkRateLimit(user.userId, MAX_MESSAGES_PER_USER, TIME_WINDOW_MS)) {
+        socket.emit('error', { 
+          code: 'RATE_LIMITED',
+          message: 'Demasiados mensajes. Espera unos segundos.',
+          retryAfter: 5
+        });
+        return;
+      }
+
+      // Crear mensaje sanitizado
       const message = {
-        id: generateMessageId(),
+        id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         username: user.username,
         userId: user.userId,
-        text: text,
+        text: messageData.text,
         timestamp: new Date().toISOString(),
-        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        type: messageData.type || 'text', // 'text', 'image', 'system'
+        metadata: messageData.metadata || {}
       };
-      
-      // IMPORTANTE: Eliminar usuario de typingUsers cuando envía mensaje
-      storage.removeTypingUser(user.username);
-      
+
+      // Procesar diferentes tipos de mensajes
+      if (messageData.type === 'image') {
+        // Validar imágenes
+        if (!messageData.metadata || !messageData.metadata.url) {
+          socket.emit('error', { 
+            code: 'INVALID_IMAGE',
+            message: 'URL de imagen inválida' 
+          });
+          return;
+        }
+        
+        // Verificar que la URL sea segura
+        if (!isValidImageUrl(messageData.metadata.url)) {
+          socket.emit('error', { 
+            code: 'UNSAFE_IMAGE',
+            message: 'URL de imagen no permitida' 
+          });
+          return;
+        }
+        
+        // Limitar tamaño de imágenes
+        if (messageData.metadata.size > 5 * 1024 * 1024) { // 5MB
+          socket.emit('error', { 
+            code: 'IMAGE_TOO_LARGE',
+            message: 'La imagen es demasiado grande (máximo 5MB)' 
+          });
+          return;
+        }
+      }
+
       // Guardar mensaje
-      storage.addMessage(message);
+      const savedMessage = storage.addMessage(message);
       
-      // Actualizar última actividad del usuario
-      user.lastActive = Date.now();
+      // Eliminar usuario de typing
+      storage.typingUsers.delete(user.username);
       
-      // Emitir evento de stopTyping para este usuario
-      socket.broadcast.emit('stopTyping', { 
+      // Emitir stopTyping
+      socket.broadcast.emit('stopTyping', {
         username: user.username,
-        userId: user.userId 
+        userId: user.userId
       });
       
       // Enviar mensaje a todos
-      io.emit('message', message);
+      io.emit('message', savedMessage);
       
-      console.log(`💬 Mensaje de ${user.username}: ${text.substring(0, 30)}...`);
+      console.log(`💬 Mensaje de ${user.username} (${messageData.type || 'text'})`);
       
     } catch (error) {
-      console.error('Error en evento message:', error);
-      socket.emit('error', { message: 'Error al enviar mensaje' });
+      console.error('Error procesando mensaje:', error.message);
+      
+      if (error.message.includes('Demasiados mensajes')) {
+        // Advertencia por rate limiting
+        socket.emit('warning', {
+          code: 'RATE_LIMIT_WARNING',
+          message: error.message,
+          type: 'rate_limit'
+        });
+        
+        // Incrementar advertencias
+        const user = storage.getUser(socket.id);
+        if (user) {
+          user.warnings++;
+          
+          // Banear después de 3 advertencias
+          if (user.warnings >= 3) {
+            storage.banIP(clientIP, 60, 'Demasiadas violaciones de rate limiting');
+            socket.emit('error', {
+              code: 'BANNED',
+              message: 'Tu IP ha sido baneada temporalmente por 60 minutos',
+              duration: 60
+            });
+            setTimeout(() => socket.disconnect(true), 3000);
+          }
+        }
+      } else {
+        socket.emit('error', { 
+          code: 'MESSAGE_ERROR',
+          message: 'Error al procesar mensaje' 
+        });
+      }
     }
   });
-  
-  // Usuario está escribiendo
+
+  // Typing con debouncing
+  let typingTimeout;
   socket.on('typing', () => {
-    try {
-      const user = storage.getUser(socket.id);
-      if (!user) return;
+    clearTimeout(typingTimeout);
+    
+    const user = storage.getUser(socket.id);
+    if (!user) return;
+    
+    // Usar debouncing para evitar spam
+    typingTimeout = setTimeout(() => {
+      storage.typingUsers.set(user.username, Date.now());
       
-      // Agregar/actualizar usuario escribiendo
-      storage.addTypingUser(user.username);
+      const typingUsersList = Array.from(storage.typingUsers.keys())
+        .filter(username => username !== user.username);
       
-      // Obtener lista actualizada
-      const typingUsersList = storage.getTypingUsers();
-      
-      // Enviar a todos excepto al usuario actual
       socket.broadcast.emit('typing', {
         username: user.username,
-        userId: user.userId,
         typingUsers: typingUsersList
       });
       
-      // Configurar timeout para auto-eliminación
+      // Auto-eliminar después de 5 segundos
       setTimeout(() => {
-        if (storage.getTypingUsers().includes(user.username)) {
-          storage.removeTypingUser(user.username);
-          socket.broadcast.emit('stopTyping', { 
-            username: user.username,
-            userId: user.userId 
+        if (storage.typingUsers.get(user.username)) {
+          storage.typingUsers.delete(user.username);
+          socket.broadcast.emit('stopTyping', {
+            username: user.username
           });
         }
-      }, TYPING_TIMEOUT);
-      
-    } catch (error) {
-      console.error('Error en evento typing:', error);
-    }
+      }, 5000);
+    }, 300); // Debounce de 300ms
   });
-  
-  // Usuario dejó de escribir
+
   socket.on('stopTyping', () => {
-    try {
-      const user = storage.getUser(socket.id);
-      if (!user) return;
-      
-      storage.removeTypingUser(user.username);
-      socket.broadcast.emit('stopTyping', { 
-        username: user.username,
-        userId: user.userId 
-      });
-      
-    } catch (error) {
-      console.error('Error en evento stopTyping:', error);
-    }
+    const user = storage.getUser(socket.id);
+    if (!user) return;
+    
+    clearTimeout(typingTimeout);
+    storage.typingUsers.delete(user.username);
+    socket.broadcast.emit('stopTyping', { username: user.username });
   });
-  
-  // Cambio de nombre de usuario
+
+  // Cambio de nombre con validación
   socket.on('usernameChange', (data) => {
     try {
       const user = storage.getUser(socket.id);
       if (!user) return;
       
-      if (!isValidUsername(data.newUsername)) {
-        socket.emit('error', { message: 'Nuevo nombre de usuario inválido' });
+      if (!data.newUsername || data.newUsername.length < 2 || data.newUsername.length > 20) {
+        socket.emit('error', { 
+          code: 'INVALID_USERNAME',
+          message: 'Nombre de usuario inválido (2-20 caracteres)' 
+        });
+        return;
+      }
+      
+      // Sanitizar nuevo nombre
+      const newUsername = storage.sanitizeInput(data.newUsername, 'username');
+      
+      // Verificar si el nombre ya está en uso
+      const isNameTaken = Array.from(storage.users.values())
+        .some(u => u.username.toLowerCase() === newUsername.toLowerCase() && u.userId !== user.userId);
+      
+      if (isNameTaken) {
+        socket.emit('error', { 
+          code: 'USERNAME_TAKEN',
+          message: 'Este nombre ya está en uso' 
+        });
         return;
       }
       
       const oldUsername = user.username;
-      const newUsername = data.newUsername.trim();
-      
-      // Actualizar username
       user.username = newUsername;
       
-      // Actualizar en typingUsers si estaba escribiendo
+      // Actualizar en typingUsers
       if (storage.typingUsers.has(oldUsername)) {
         storage.typingUsers.delete(oldUsername);
-        storage.addTypingUser(newUsername);
+        storage.typingUsers.set(newUsername, Date.now());
       }
       
       // Actualizar mensajes existentes
@@ -381,27 +506,33 @@ io.on('connection', (socket) => {
       
       // Notificar a todos
       io.emit('usernameChanged', {
-        oldUsername: oldUsername,
-        newUsername: newUsername,
-        userId: user.userId
+        oldUsername,
+        newUsername,
+        userId: user.userId,
+        timestamp: new Date().toISOString()
       });
       
-      // Actualizar lista de usuarios en línea
       updateOnlineUsers();
       
-      console.log(`📝 ${oldUsername} cambió nombre a ${newUsername}`);
+      console.log(`📝 ${oldUsername} → ${newUsername}`);
       
     } catch (error) {
-      console.error('Error en evento usernameChange:', error);
-      socket.emit('error', { message: 'Error al cambiar nombre' });
+      console.error('Error en cambio de nombre:', error);
+      socket.emit('error', { 
+        code: 'USERNAME_CHANGE_ERROR',
+        message: 'Error al cambiar nombre' 
+      });
     }
   });
-  
-  // Ping
-  socket.on('ping', () => {
-    socket.emit('pong', { timestamp: Date.now() });
+
+  // Ping/pong para medir latencia
+  socket.on('ping', (data) => {
+    socket.emit('pong', { 
+      timestamp: data.timestamp,
+      serverTime: Date.now() 
+    });
   });
-  
+
   // Solicitar usuarios en línea
   socket.on('requestOnlineUsers', () => {
     try {
@@ -415,38 +546,46 @@ io.on('connection', (socket) => {
       console.error('Error en requestOnlineUsers:', error);
     }
   });
-  
-  // Desconexión
-  socket.on('disconnect', () => {
+
+  // Solicitar estadísticas del servidor
+  socket.on('requestServerStats', () => {
     try {
-      const user = storage.removeUser(socket.id);
-      
-      if (user) {
-        // Notificar a todos
-        io.emit('userLeft', {
-          username: user.username,
-          userId: user.userId,
-          onlineCount: storage.users.size
-        });
-        
-        // Actualizar lista de usuarios
-        updateOnlineUsers();
-        
-        console.log(`👋 ${user.username} se desconectó. Quedan: ${storage.users.size}`);
-      }
-      
+      const stats = storage.getStats();
+      socket.emit('serverStats', {
+        ...stats,
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
+      });
     } catch (error) {
-      console.error('Error en desconexión:', error);
+      console.error('Error en requestServerStats:', error);
     }
   });
-  
-  // Error de socket
+
+  // Desconexión
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 Usuario desconectado: ${socket.id}, razón: ${reason}`);
+    
+    const user = storage.removeUser(socket.id);
+    if (user) {
+      io.emit('userLeft', {
+        username: user.username,
+        userId: user.userId,
+        onlineCount: storage.users.size,
+        reason: reason,
+        timestamp: new Date().toISOString()
+      });
+      
+      updateOnlineUsers();
+    }
+  });
+
+  // Error handler
   socket.on('error', (error) => {
     console.error('Socket error:', error);
   });
 });
 
-// Función para actualizar usuarios en línea
+// ===== FUNCIONES AUXILIARES =====
 function updateOnlineUsers() {
   try {
     const onlineUsers = Array.from(storage.users.values()).map(u => ({
@@ -456,39 +595,63 @@ function updateOnlineUsers() {
     
     io.emit('onlineUsers', onlineUsers);
     io.emit('userCount', onlineUsers.length);
-    
   } catch (error) {
     console.error('Error en updateOnlineUsers:', error);
   }
 }
 
+function isValidImageUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const allowedProtocols = ['http:', 'https:'];
+    const allowedDomains = [
+      'i.imgur.com',
+      'images.unsplash.com',
+      'cdn.discordapp.com'
+    ];
+    
+    return allowedProtocols.includes(parsed.protocol) &&
+           allowedDomains.some(domain => parsed.hostname.endsWith(domain));
+  } catch {
+    return false;
+  }
+}
+
 // ===== RUTAS HTTP =====
-// Ruta de prueba/estado
 app.get('/', (req, res) => {
   const stats = storage.getStats();
   
   res.json({
     status: 'active',
-    server: 'FoxWeb Chat Server v3.0',
+    server: 'FoxWeb Chat Server v4.0',
+    version: '4.0.0',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     features: [
-      'Chat en tiempo real optimizado',
-      'Historial inteligente de 24 horas',
-      'Indicador de escritura mejorado',
-      'Cambio de nombre en tiempo real',
-      'Ping automático y limpieza'
+      'Chat en tiempo real con WebSockets',
+      'Rate limiting y protección contra spam',
+      'Sanitización de entrada XSS',
+      'Soporte para imágenes y emojis',
+      'Historial de 24 horas',
+      'Notificaciones en tiempo real'
     ],
+    security: {
+      rateLimiting: true,
+      xssProtection: true,
+      inputSanitization: true,
+      cors: true,
+      helmet: true
+    },
     stats: stats,
     limits: {
-      maxMessages: MAX_MESSAGES,
-      retentionHours: MESSAGE_RETENTION_HOURS,
-      typingTimeout: TYPING_TIMEOUT / 1000 + 's'
+      maxMessageLength: 500,
+      maxMessagesPerUser: `${MAX_MESSAGES_PER_USER}/5s`,
+      imageSizeLimit: '5MB',
+      retentionHours: MESSAGE_RETENTION_HOURS
     }
   });
 });
 
-// Ruta para obtener estadísticas
 app.get('/stats', (req, res) => {
   const stats = storage.getStats();
   
@@ -497,118 +660,125 @@ app.get('/stats', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     ...stats,
-    messageRetention: `${MESSAGE_RETENTION_HOURS} horas`,
-    cleanupInterval: `${CLEANUP_INTERVAL / 60000} minutos`
+    memoryUsage: process.memoryUsage(),
+    nodeVersion: process.version
   });
 });
 
-// Ruta para obtener mensajes (debug/API)
-app.get('/messages', (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-    const recentMessages = storage.messages.slice(-limit);
-    
-    res.json({
-      success: true,
-      count: recentMessages.length,
-      total: storage.messages.length,
-      messages: recentMessages
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Ruta para limpieza manual
-app.post('/cleanup', (req, res) => {
-  try {
-    const before = storage.messages.length;
-    const after = storage.cleanOldMessages(MESSAGE_RETENTION_HOURS);
-    
-    res.json({
-      success: true,
-      cleaned: before - after,
-      remaining: after,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Ruta health check para Render
 app.get('/health', (req, res) => {
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    checks: {
+      storage: storage.messages.length >= 0,
+      connections: storage.users.size >= 0,
+      memory: process.memoryUsage().heapUsed < 500 * 1024 * 1024 // < 500MB
+    }
   });
 });
 
-// Middleware para errores 404
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Ruta no encontrada',
-    availableRoutes: ['/', '/stats', '/messages', '/health', '/cleanup']
-  });
+// Ruta para administración (protegida)
+app.get('/admin/stats', (req, res) => {
+  const auth = req.headers.authorization;
+  
+  // Autenticación básica para admin
+  if (auth !== `Bearer ${process.env.ADMIN_TOKEN}`) {
+    return res.status(403).json({ error: 'No autorizado' });
+  }
+  
+  const detailedStats = {
+    ...storage.getStats(),
+    users: Array.from(storage.users.values()).map(u => ({
+      username: u.username,
+      ip: u.ip,
+      joined: u.joined,
+      messageCount: u.messageCount,
+      warnings: u.warnings
+    })),
+    bannedIPs: Array.from(storage.bannedIPs.entries()).map(([ip, data]) => ({
+      ip,
+      ...data
+    })),
+    recentMessages: storage.messages.slice(-10)
+  };
+  
+  res.json(detailedStats);
 });
+
+// Limpieza periódica de mensajes antiguos
+setInterval(() => {
+  try {
+    const cutoff = Date.now() - (MESSAGE_RETENTION_HOURS * 60 * 60 * 1000);
+    const initialCount = storage.messages.length;
+    
+    storage.messages = storage.messages.filter(msg => {
+      const msgTime = new Date(msg.timestamp).getTime();
+      return msgTime >= cutoff;
+    });
+    
+    const removed = initialCount - storage.messages.length;
+    if (removed > 0) {
+      console.log(`🧹 Limpieza automática: ${removed} mensajes antiguos eliminados`);
+    }
+  } catch (error) {
+    console.error('Error en limpieza automática:', error);
+  }
+}, CLEANUP_INTERVAL);
 
 // ===== INICIAR SERVIDOR =====
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Servidor FoxWeb Chat v3.0 iniciado`);
+  console.log(`🚀 FoxWeb Chat Server v4.0 iniciado`);
   console.log(`📡 Puerto: ${PORT}`);
-  console.log(`💾 Almacenamiento: Memoria (${MAX_MESSAGES} mensajes máx.)`);
-  console.log(`⏳ Retención: ${MESSAGE_RETENTION_HOURS} horas`);
-  console.log(`✍️  Timeout typing: ${TYPING_TIMEOUT / 1000} segundos`);
+  console.log(`🔒 Características de seguridad activadas`);
+  console.log(`⏳ Retención de mensajes: ${MESSAGE_RETENTION_HOURS} horas`);
+  console.log(`⚡ Rate limiting: ${MAX_MESSAGES_PER_USER} mensajes/5s por usuario`);
   
-  // Limpieza inicial
-  const remaining = storage.cleanOldMessages(MESSAGE_RETENTION_HOURS);
-  console.log(`🧹 Limpieza inicial: ${remaining} mensajes`);
-  
-  // Iniciar ping automático después de 10 segundos
-  setTimeout(startPingService, 10000);
+  // Iniciar ping automático para mantener activo en render.com
+  if (process.env.RENDER_EXTERNAL_URL) {
+    const keepAlive = require('./keepAlive');
+    keepAlive.start(process.env.RENDER_EXTERNAL_URL);
+  }
 });
 
 // ===== MANEJO DE SEÑALES =====
 function gracefulShutdown() {
   console.log('🛑 Iniciando apagado graceful...');
   
-  clearInterval(pingServiceInterval);
-  
-  // Desconectar todos los sockets
-  io.disconnectSockets();
-  
-  // Cerrar servidor
-  server.close(() => {
-    console.log('✅ Servidor cerrado correctamente');
-    process.exit(0);
+  // Notificar a todos los usuarios
+  io.emit('system', {
+    type: 'warning',
+    message: 'El servidor se reiniciará en 10 segundos',
+    timestamp: new Date().toISOString()
   });
   
-  // Timeout forzoso después de 10 segundos
+  // Desconectar todos los sockets después de 5 segundos
   setTimeout(() => {
-    console.log('⚠️  Apagado forzoso después de timeout');
+    io.disconnectSockets();
+    
+    server.close(() => {
+      console.log('✅ Servidor cerrado correctamente');
+      process.exit(0);
+    });
+  }, 5000);
+  
+  // Timeout forzoso
+  setTimeout(() => {
+    console.log('⚠️ Apagado forzoso después de timeout');
     process.exit(1);
   }, 10000);
 }
 
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
-
-// Manejar errores no capturados
 process.on('uncaughtException', (error) => {
   console.error('❌ Error no capturado:', error);
-  // No salir inmediatamente para mantener el servicio activo
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Promesa rechazada no manejada:', reason);
 });
+
+module.exports = { server, storage };
