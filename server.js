@@ -117,7 +117,7 @@ app.get('/api/status', (req, res) => {
 
 // 4. Servir la aplicación
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'chat.html'));
+    res.sendFile(path.join(__dirname, 'https://foxweb.pages.dev/chat'));
 });
 
 // ===== ESTADO DEL SERVIDOR =====
